@@ -1,7 +1,7 @@
 {
   "domain": "restore_last_changed",
   "name": "Restore Last Changed",
-  "documentation": "https://github.com/remy/ha_addons_and_integrations",
+  "documentation": "https://github.com/remy/ha_restore_last_changed",
   "requirements": [],
   "dependencies": ["recorder"],
   "codeowners": [],
