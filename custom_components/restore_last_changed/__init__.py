@@ -105,16 +105,19 @@ async def _restore_entity(
         last_state.last_updated,
     )
 
-    # `last_changed` was removed from StateMachine.async_set() in newer HA
-    # versions (it is now derived automatically from state-value transitions).
-    # Use introspection so the integration works across HA versions.
-    set_kwargs: dict = {"last_updated": last_state.last_updated}
-    if "last_changed" in inspect.signature(hass.states.async_set).parameters:
+    # Both `last_changed` and `last_updated` were removed from
+    # StateMachine.async_set() in newer HA versions.  Use introspection so the
+    # integration works across HA versions without crashing.
+    supported = inspect.signature(hass.states.async_set).parameters
+    set_kwargs: dict = {}
+    if "last_updated" in supported:
+        set_kwargs["last_updated"] = last_state.last_updated
+    if "last_changed" in supported:
         set_kwargs["last_changed"] = last_state.last_changed
-    else:
+    if not set_kwargs:
         _LOGGER.debug(
-            "This HA version does not support setting last_changed directly; "
-            "only last_updated will be restored for %s.",
+            "This HA version does not support setting last_changed/last_updated "
+            "directly; timestamps cannot be restored for %s.",
             entity_id,
         )
 
