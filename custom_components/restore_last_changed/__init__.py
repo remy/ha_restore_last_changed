@@ -105,28 +105,46 @@ async def _restore_entity(
         last_state.last_updated,
     )
 
-    # Both `last_changed` and `last_updated` were removed from
-    # StateMachine.async_set() in newer HA versions.  Use introspection so the
-    # integration works across HA versions without crashing.
+    # HA has changed the async_set() signature across versions:
+    #   - Older HA:  last_changed=<datetime>, last_updated=<datetime>
+    #   - Newer HA:  timestamp=<float>  (unix timestamp; drives both fields)
+    # Use introspection to pick the right approach at runtime.
     supported = inspect.signature(hass.states.async_set).parameters
-    set_kwargs: dict = {}
-    if "last_updated" in supported:
-        set_kwargs["last_updated"] = last_state.last_updated
     if "last_changed" in supported:
-        set_kwargs["last_changed"] = last_state.last_changed
-    if not set_kwargs:
-        _LOGGER.debug(
-            "This HA version does not support setting last_changed/last_updated "
-            "directly; timestamps cannot be restored for %s.",
+        # Oldest API: explicit datetime kwargs.
+        set_kwargs: dict = {"last_updated": last_state.last_updated}
+        if "last_changed" in supported:
+            set_kwargs["last_changed"] = last_state.last_changed
+        hass.states.async_set(
             entity_id,
+            last_state.state,
+            last_state.attributes,
+            **set_kwargs,
         )
-
-    hass.states.async_set(
-        entity_id,
-        last_state.state,
-        last_state.attributes,
-        **set_kwargs,
-    )
+    elif "timestamp" in supported:
+        # Newer API: single float timestamp.  Pass last_changed's unix value so
+        # that, when the state value differs from the current state, HA derives
+        # last_changed = last_updated = historical last_changed.  This is the
+        # best approximation available — last_updated accuracy is sacrificed in
+        # favour of last_changed accuracy, which is this integration's purpose.
+        hass.states.async_set(
+            entity_id,
+            last_state.state,
+            last_state.attributes,
+            timestamp=last_state.last_changed.timestamp(),
+        )
+    else:
+        _LOGGER.warning(
+            "Cannot restore timestamps for %s: no supported timestamp parameter "
+            "found on StateMachine.async_set() (params: %s).",
+            entity_id,
+            list(supported),
+        )
+        hass.states.async_set(
+            entity_id,
+            last_state.state,
+            last_state.attributes,
+        )
 
 
 def _fetch_last_state(hass: HomeAssistant, entity_id: str) -> dict:
