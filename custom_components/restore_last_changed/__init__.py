@@ -131,6 +131,7 @@ async def _restore_entity(
             entity_id,
             last_state.state,
             last_state.attributes,
+            force_update=True,
             timestamp=last_state.last_changed.timestamp(),
         )
     else:
