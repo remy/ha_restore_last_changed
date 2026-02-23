@@ -87,7 +87,7 @@ async def _restore_entity(
 
     # get_last_state_changes returns a dict[entity_id, list[State]].
     # We ask for the 1 most-recent change.
-    history_result: dict = await hass.async_add_executor_job(
+    history_result: dict = await recorder_instance.async_add_executor_job(
         _fetch_last_state, hass, entity_id
     )
 
