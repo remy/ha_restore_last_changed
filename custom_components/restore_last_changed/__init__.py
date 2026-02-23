@@ -9,6 +9,7 @@ Configuration example (configuration.yaml):
 """
 
 import asyncio
+import inspect
 import logging
 
 from homeassistant.components import recorder
@@ -104,12 +105,24 @@ async def _restore_entity(
         last_state.last_updated,
     )
 
+    # `last_changed` was removed from StateMachine.async_set() in newer HA
+    # versions (it is now derived automatically from state-value transitions).
+    # Use introspection so the integration works across HA versions.
+    set_kwargs: dict = {"last_updated": last_state.last_updated}
+    if "last_changed" in inspect.signature(hass.states.async_set).parameters:
+        set_kwargs["last_changed"] = last_state.last_changed
+    else:
+        _LOGGER.debug(
+            "This HA version does not support setting last_changed directly; "
+            "only last_updated will be restored for %s.",
+            entity_id,
+        )
+
     hass.states.async_set(
         entity_id,
         last_state.state,
         last_state.attributes,
-        last_changed=last_state.last_changed,
-        last_updated=last_state.last_updated,
+        **set_kwargs,
     )
 
 
