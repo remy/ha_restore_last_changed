@@ -1,0 +1,14 @@
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: ha_restore_last_changed_dev
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+    volumes:
+      - ./config:/config
+      # Live-mount the integration source so edits are picked up on HA restart.
+      - ../custom_components/restore_last_changed:/config/custom_components/restore_last_changed
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=Europe/London

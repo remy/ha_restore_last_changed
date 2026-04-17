@@ -1,0 +1,3 @@
+# HA populates these at runtime — keep the repo clean.
+config/*
+!config/configuration.yaml

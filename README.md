@@ -79,3 +79,21 @@ logger:
 
 **Warning: "Recorder instance not available"**
 - The recorder integration may not be loaded. Ensure `recorder:` is present in your `configuration.yaml` (or that it hasn't been explicitly disabled).
+
+## Services (for testing / one-off use)
+
+Two services are exposed so you can verify behaviour without restarting HA:
+
+| Service | Description |
+|---|---|
+| `restore_last_changed.dump` | Logs (at `warning` level) the entity's current state-machine timestamps alongside what the recorder has for it. |
+| `restore_last_changed.restore` | Runs the restore logic against one entity, with selectable `strategy` (`async_set`, `async_set_force`, `mutate`, `replace`). |
+
+Call them from *Developer Tools → Services*. The chosen `strategy` on the
+`restore` service lets you experiment with different restoration techniques if
+the default isn't working in your HA version.
+
+## Local development
+
+A ready-to-run Docker setup lives under [`dev/`](dev/). See [`dev/README.md`](dev/README.md)
+for the reload loop and test recipe.

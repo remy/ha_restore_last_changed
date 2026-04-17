@@ -1,0 +1,27 @@
+default_config:
+
+logger:
+  default: warning
+  logs:
+    custom_components.restore_last_changed: debug
+
+# Test entities — easy to toggle from the UI so they get recorder history.
+input_boolean:
+  test_one:
+    name: Test One
+  test_two:
+    name: Test Two
+
+input_number:
+  test_number:
+    name: Test Number
+    min: 0
+    max: 100
+    step: 1
+    initial: 0
+
+restore_last_changed:
+  entities:
+    - input_boolean.test_one
+    - input_boolean.test_two
+    - input_number.test_number

@@ -6,15 +6,37 @@ Configuration example (configuration.yaml):
       entities:
         - sensor.my_sensor
         - binary_sensor.front_door
+
+Two services are exposed for iterative testing without restarting HA:
+
+    service: restore_last_changed.dump
+    data:
+      entity_id: sensor.my_sensor
+
+        Logs, side by side, what the state machine currently holds and what the
+        recorder believes was the last state before the most recent restart.
+
+    service: restore_last_changed.restore
+    data:
+      entity_id: sensor.my_sensor
+      strategy: mutate      # optional; see STRATEGIES below
+
+        Attempts to restore last_changed/last_updated for a single entity using
+        the selected strategy, with verbose logging so the outcome can be
+        verified in Developer Tools -> States.
 """
 
 import asyncio
 import inspect
 import logging
+from typing import Any
+
+import voluptuous as vol
 
 from homeassistant.components import recorder
 from homeassistant.components.recorder import history
-from homeassistant.core import Event, HomeAssistant
+from homeassistant.core import Event, HomeAssistant, ServiceCall, State
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
 from .const import CONF_ENTITIES, DOMAIN, STARTUP_DELAY
@@ -22,133 +44,277 @@ from .schema import CONFIG_SCHEMA  # noqa: F401 – HA reads this from the modul
 
 _LOGGER = logging.getLogger(__name__)
 
-# Re-export so HA can discover the schema on import.
 __all__ = ["CONFIG_SCHEMA", "async_setup"]
+
+STRATEGY_ASYNC_SET = "async_set"
+STRATEGY_ASYNC_SET_FORCE = "async_set_force"
+STRATEGY_MUTATE = "mutate"
+STRATEGY_REPLACE = "replace"
+
+STRATEGIES = (
+    STRATEGY_ASYNC_SET,
+    STRATEGY_ASYNC_SET_FORCE,
+    STRATEGY_MUTATE,
+    STRATEGY_REPLACE,
+)
+
+DEFAULT_STRATEGY = STRATEGY_MUTATE
+
+SERVICE_DUMP = "dump"
+SERVICE_RESTORE = "restore"
+
+SERVICE_DUMP_SCHEMA = vol.Schema({vol.Required("entity_id"): cv.entity_id})
+
+SERVICE_RESTORE_SCHEMA = vol.Schema(
+    {
+        vol.Required("entity_id"): cv.entity_id,
+        vol.Optional("strategy", default=DEFAULT_STRATEGY): vol.In(STRATEGIES),
+    }
+)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the restore_last_changed integration."""
 
-    domain_config = config.get(DOMAIN)
-    if not domain_config:
-        return True
-
+    domain_config = config.get(DOMAIN) or {}
     entity_ids: list[str] = domain_config.get(CONF_ENTITIES, [])
+
+    _register_services(hass)
+
     if not entity_ids:
-        _LOGGER.debug("No entities configured, nothing to restore.")
+        _LOGGER.debug("No entities configured; services are still available.")
         return True
 
-    async def _restore_timestamps(_event: Event) -> None:
+    async def _restore_on_start(_event: Event) -> None:
         """Run after HA is fully started."""
-        # Give entity platforms and the recorder time to finish their own
-        # startup tasks before we query.
         await asyncio.sleep(STARTUP_DELAY)
-
-        try:
-            recorder_instance = recorder.get_instance(hass)
-        except Exception:  # pylint: disable=broad-except
-            _LOGGER.warning(
-                "Recorder instance not available; skipping last_changed restore."
-            )
-            return
-
         for entity_id in entity_ids:
             try:
-                await _restore_entity(hass, recorder_instance, entity_id)
+                await _restore_entity(hass, entity_id, DEFAULT_STRATEGY)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception(
                     "Unexpected error restoring timestamps for %s", entity_id
                 )
 
-    hass.bus.async_listen_once(
-        "homeassistant_started",  # EVENT_HOMEASSISTANT_STARTED value
-        _restore_timestamps,
-    )
+    hass.bus.async_listen_once("homeassistant_started", _restore_on_start)
 
     return True
 
 
+def _register_services(hass: HomeAssistant) -> None:
+    """Register dump / restore services. Idempotent across reloads."""
+
+    async def handle_dump(call: ServiceCall) -> None:
+        await _dump_entity(hass, call.data["entity_id"])
+
+    async def handle_restore(call: ServiceCall) -> None:
+        await _restore_entity(
+            hass, call.data["entity_id"], call.data["strategy"]
+        )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_DUMP, handle_dump, schema=SERVICE_DUMP_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_RESTORE, handle_restore, schema=SERVICE_RESTORE_SCHEMA
+    )
+
+
+async def _dump_entity(hass: HomeAssistant, entity_id: str) -> None:
+    """Log what the state machine has vs. what the recorder has."""
+
+    current = hass.states.get(entity_id)
+    if current is None:
+        _LOGGER.warning("[dump] %s: not present in state machine", entity_id)
+    else:
+        _LOGGER.warning(
+            "[dump] %s state-machine: state=%r last_changed=%s last_updated=%s",
+            entity_id,
+            current.state,
+            current.last_changed.isoformat(),
+            current.last_updated.isoformat(),
+        )
+
+    recorded = await _fetch_last_recorded_state(hass, entity_id)
+    if recorded is None:
+        _LOGGER.warning("[dump] %s recorder: no history found", entity_id)
+        return
+
+    _LOGGER.warning(
+        "[dump] %s recorder: state=%r last_changed=%s last_updated=%s",
+        entity_id,
+        recorded.state,
+        recorded.last_changed.isoformat(),
+        recorded.last_updated.isoformat(),
+    )
+
+
 async def _restore_entity(
-    hass: HomeAssistant,
-    recorder_instance: recorder.Recorder,
-    entity_id: str,
+    hass: HomeAssistant, entity_id: str, strategy: str
 ) -> None:
     """Restore last_changed / last_updated for a single entity."""
 
-    # Skip entities that don't currently exist in the state machine – we must
-    # not create phantom states for entities whose platform hasn't loaded yet
-    # or that simply aren't configured.
-    current_state = hass.states.get(entity_id)
-    if current_state is None:
-        _LOGGER.debug(
-            "Entity %s not found in state machine, skipping restore.", entity_id
+    current = hass.states.get(entity_id)
+    if current is None:
+        _LOGGER.warning(
+            "[restore] %s: not in state machine, skipping", entity_id
         )
         return
 
-    # get_last_state_changes returns a dict[entity_id, list[State]].
-    # We ask for the 1 most-recent change.
-    history_result: dict = await hass.async_add_executor_job(
-        _fetch_last_state, hass, entity_id
-    )
-
-    states = history_result.get(entity_id)
-    if not states:
-        _LOGGER.debug("No history found for %s, skipping restore.", entity_id)
+    recorded = await _fetch_last_recorded_state(hass, entity_id)
+    if recorded is None:
+        _LOGGER.warning("[restore] %s: no recorder history, skipping", entity_id)
         return
-
-    last_state = states[-1]
 
     _LOGGER.info(
-        "Restoring timestamps for %s: last_changed=%s, last_updated=%s",
+        "[restore:%s] %s before: last_changed=%s -> target=%s",
+        strategy,
         entity_id,
-        last_state.last_changed,
-        last_state.last_updated,
+        current.last_changed.isoformat(),
+        recorded.last_changed.isoformat(),
     )
 
-    # HA has changed the async_set() signature across versions:
-    #   - Older HA:  last_changed=<datetime>, last_updated=<datetime>
-    #   - Newer HA:  timestamp=<float>  (unix timestamp; drives both fields)
-    # Use introspection to pick the right approach at runtime.
-    supported = inspect.signature(hass.states.async_set).parameters
-    if "last_changed" in supported:
-        # Oldest API: explicit datetime kwargs.
-        set_kwargs: dict = {"last_updated": last_state.last_updated}
-        if "last_changed" in supported:
-            set_kwargs["last_changed"] = last_state.last_changed
-        hass.states.async_set(
-            entity_id,
-            last_state.state,
-            last_state.attributes,
-            **set_kwargs,
-        )
-    elif "timestamp" in supported:
-        # Newer API: single float timestamp.  Pass last_changed's unix value so
-        # that, when the state value differs from the current state, HA derives
-        # last_changed = last_updated = historical last_changed.  This is the
-        # best approximation available — last_updated accuracy is sacrificed in
-        # favour of last_changed accuracy, which is this integration's purpose.
-        hass.states.async_set(
-            entity_id,
-            last_state.state,
-            last_state.attributes,
-            timestamp=last_state.last_changed.timestamp(),
-        )
+    if strategy == STRATEGY_ASYNC_SET:
+        _apply_async_set(hass, entity_id, recorded, force=False)
+    elif strategy == STRATEGY_ASYNC_SET_FORCE:
+        _apply_async_set(hass, entity_id, recorded, force=True)
+    elif strategy == STRATEGY_MUTATE:
+        _apply_mutate(hass, entity_id, recorded)
+    elif strategy == STRATEGY_REPLACE:
+        _apply_replace(hass, entity_id, recorded)
     else:
-        _LOGGER.warning(
-            "Cannot restore timestamps for %s: no supported timestamp parameter "
-            "found on StateMachine.async_set() (params: %s).",
-            entity_id,
-            list(supported),
-        )
-        hass.states.async_set(
-            entity_id,
-            last_state.state,
-            last_state.attributes,
-        )
+        _LOGGER.error("[restore] unknown strategy %r", strategy)
+        return
+
+    after = hass.states.get(entity_id)
+    if after is None:
+        _LOGGER.warning("[restore:%s] %s: vanished after set", strategy, entity_id)
+        return
+
+    match = after.last_changed == recorded.last_changed
+    _LOGGER.warning(
+        "[restore:%s] %s after: last_changed=%s last_updated=%s match=%s",
+        strategy,
+        entity_id,
+        after.last_changed.isoformat(),
+        after.last_updated.isoformat(),
+        match,
+    )
 
 
-def _fetch_last_state(hass: HomeAssistant, entity_id: str) -> dict:
-    """Blocking helper – must be called via async_add_executor_job."""
+def _apply_async_set(
+    hass: HomeAssistant, entity_id: str, recorded: State, force: bool
+) -> None:
+    """Strategy: use the public StateMachine.async_set() API."""
+    params = inspect.signature(hass.states.async_set).parameters
+    kwargs: dict[str, Any] = {}
+    if force and "force_update" in params:
+        kwargs["force_update"] = True
+
+    if "last_changed" in params:
+        kwargs["last_changed"] = recorded.last_changed
+        if "last_updated" in params:
+            kwargs["last_updated"] = recorded.last_updated
+    elif "timestamp" in params:
+        kwargs["timestamp"] = recorded.last_changed.timestamp()
+
+    hass.states.async_set(
+        entity_id, recorded.state, recorded.attributes, **kwargs
+    )
+
+
+def _apply_mutate(
+    hass: HomeAssistant, entity_id: str, recorded: State
+) -> None:
+    """Strategy: mutate timestamps on the live State object in place.
+
+    Bypasses the state machine's dedup path entirely. Slightly invasive but
+    usually safe: State objects use __slots__ for these fields and HA's
+    change-tracking only fires when async_set() is called.
+    """
+    state_obj = hass.states.get(entity_id)
+    if state_obj is None:
+        return
+
+    _set_state_attr(state_obj, "last_changed", recorded.last_changed)
+    _set_state_attr(state_obj, "last_updated", recorded.last_updated)
+    # last_reported was added in recent HA; only set if present.
+    if hasattr(state_obj, "last_reported"):
+        _set_state_attr(state_obj, "last_reported", recorded.last_updated)
+
+    # Invalidate cached timestamp floats so they recompute from the new values.
+    cache = getattr(state_obj, "_cache", None)
+    if cache is not None:
+        for key in (
+            "last_changed_timestamp",
+            "last_updated_timestamp",
+            "last_reported_timestamp",
+            "as_compressed_state",
+            "as_compressed_state_json",
+            "json_fragment",
+            "as_dict_json",
+        ):
+            cache.pop(key, None)
+
+
+def _apply_replace(
+    hass: HomeAssistant, entity_id: str, recorded: State
+) -> None:
+    """Strategy: drop a freshly built State into the private _states dict."""
+    try:
+        new_state = State(
+            entity_id,
+            recorded.state,
+            dict(recorded.attributes),
+            last_changed=recorded.last_changed,
+            last_updated=recorded.last_updated,
+            context=hass.states.get(entity_id).context if hass.states.get(entity_id) else None,
+        )
+    except TypeError:
+        # Some HA versions only accept some of these kwargs; fall back.
+        new_state = State(entity_id, recorded.state, dict(recorded.attributes))
+        _set_state_attr(new_state, "last_changed", recorded.last_changed)
+        _set_state_attr(new_state, "last_updated", recorded.last_updated)
+
+    # hass.states._states is a dict-like internal store across HA versions.
+    store = getattr(hass.states, "_states", None)
+    if store is None:
+        _LOGGER.error("[restore:replace] hass.states._states not accessible")
+        return
+    store[entity_id] = new_state
+
+
+def _set_state_attr(state_obj: State, attr: str, value: Any) -> None:
+    """Set an attribute on a State object, tolerating __slots__ / frozen fields."""
+    try:
+        setattr(state_obj, attr, value)
+    except (AttributeError, TypeError) as err:
+        _LOGGER.debug(
+            "Cannot set %s.%s directly (%s); trying object.__setattr__",
+            type(state_obj).__name__, attr, err,
+        )
+        try:
+            object.__setattr__(state_obj, attr, value)
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception(
+                "Failed to set %s on State for diagnostic", attr
+            )
+
+
+async def _fetch_last_recorded_state(
+    hass: HomeAssistant, entity_id: str
+) -> State | None:
+    """Query recorder for the most recent historical state of an entity."""
+    instance = recorder.get_instance(hass)
+    result = await instance.async_add_executor_job(_fetch_blocking, hass, entity_id)
+    states = result.get(entity_id) if result else None
+    if not states:
+        return None
+    return states[-1]
+
+
+def _fetch_blocking(hass: HomeAssistant, entity_id: str) -> dict:
+    """Blocking recorder query — must be called via async_add_executor_job."""
     try:
         return history.get_last_state_changes(hass, 1, entity_id)
     except Exception:  # pylint: disable=broad-except
