@@ -29,6 +29,7 @@ Two services are exposed for iterative testing without restarting HA:
 import asyncio
 import inspect
 import logging
+from datetime import datetime
 from typing import Any
 
 import voluptuous as vol
@@ -71,7 +72,6 @@ SERVICE_RESTORE_SCHEMA = vol.Schema(
         vol.Optional("strategy", default=DEFAULT_STRATEGY): vol.In(STRATEGIES),
     }
 )
-
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the restore_last_changed integration."""
@@ -241,18 +241,30 @@ def _apply_mutate(
     # last_reported was added in recent HA; only set if present.
     if hasattr(state_obj, "last_reported"):
         _set_state_attr(state_obj, "last_reported", recorded.last_updated)
+    # last_updated_timestamp is a __slots__ attribute on modern HA (used
+    # directly by the REST API / websocket serialisers). Update it too or
+    # callers will see the pre-mutation timestamp.
+    if hasattr(state_obj, "last_updated_timestamp"):
+        _set_state_attr(
+            state_obj,
+            "last_updated_timestamp",
+            recorded.last_updated.timestamp(),
+        )
 
-    # Invalidate cached timestamp floats so they recompute from the new values.
+    # Invalidate cached values derived from the timestamps. These are stored
+    # on state_obj._cache by propcache and must be popped so they recompute
+    # from the mutated slot values above.
     cache = getattr(state_obj, "_cache", None)
     if cache is not None:
         for key in (
             "last_changed_timestamp",
-            "last_updated_timestamp",
             "last_reported_timestamp",
             "as_compressed_state",
             "as_compressed_state_json",
             "json_fragment",
             "as_dict_json",
+            "_as_dict",
+            "_as_read_only_dict",
         ):
             cache.pop(key, None)
 
@@ -304,21 +316,58 @@ def _set_state_attr(state_obj: State, attr: str, value: Any) -> None:
 async def _fetch_last_recorded_state(
     hass: HomeAssistant, entity_id: str
 ) -> State | None:
-    """Query recorder for the most recent historical state of an entity."""
+    """Query recorder for the last state change before this HA session started.
+
+    Using the recorder's "latest state" directly is wrong: once HA starts,
+    entities immediately write new rows (default values, restored values, etc.)
+    and those become the "latest" state — which is the post-restart value, not
+    the pre-restart one we want to restore.
+
+    The recorder's ``recording_start`` is captured when the recorder itself
+    initialises, which is earlier than any entity platform setup, so rows
+    written at/after that time belong to the current session and must be
+    skipped.
+    """
     instance = recorder.get_instance(hass)
-    result = await instance.async_add_executor_job(_fetch_blocking, hass, entity_id)
-    states = result.get(entity_id) if result else None
+    session_start: datetime = instance.recorder_runs_manager.recording_start
+
+    states = await instance.async_add_executor_job(
+        _fetch_blocking, hass, entity_id
+    )
     if not states:
         return None
-    return states[-1]
+    # ``states`` is ordered oldest-first. Walk from newest backwards to find
+    # the first state recorded strictly before this session started.
+    for state in reversed(states):
+        if state.last_updated < session_start:
+            return state
+    return None
 
 
-def _fetch_blocking(hass: HomeAssistant, entity_id: str) -> dict:
+# Number of most-recent state rows to inspect when looking for the last
+# pre-startup state. HA can record a burst of rows during startup (entity
+# registration, restore_state rehydrate, etc.), so this must be comfortably
+# larger than that burst — 50 is plenty in practice.
+FETCH_BATCH_SIZE = 50
+
+
+def _fetch_blocking(hass: HomeAssistant, entity_id: str) -> list[State]:
     """Blocking recorder query — must be called via async_add_executor_job."""
     try:
-        return history.get_last_state_changes(hass, 1, entity_id)
+        result = history.get_last_state_changes(
+            hass, FETCH_BATCH_SIZE, entity_id
+        )
+        states = result.get(entity_id) or []
+        _LOGGER.debug(
+            "get_last_state_changes(%s, %d) -> %d rows, newest=%s",
+            entity_id,
+            FETCH_BATCH_SIZE,
+            len(states),
+            states[-1].last_updated.isoformat() if states else None,
+        )
+        return states
     except Exception:  # pylint: disable=broad-except
         _LOGGER.warning(
             "Failed to query recorder history for %s.", entity_id, exc_info=True
         )
-        return {}
+        return []
