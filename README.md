@@ -21,7 +21,33 @@ config/
 
 ## Configuration
 
-Add the following to your `configuration.yaml`:
+The recommended setup is to point this integration at a **group entity** that
+you manage from the Home Assistant UI. That way you can add or remove entities
+to the restore list from *Settings → Devices & Services → Helpers* without
+editing YAML or restarting.
+
+### 1. Create a group from the UI (preferred)
+
+1. Go to *Settings → Devices & Services → Helpers → + Create Helper → Group*.
+2. Pick any group type (sensor, binary sensor, switch, etc. — only the member
+   list matters here).
+3. Name it something like *Restore Last Changed* and add the entities whose
+   timestamps you want preserved across restarts.
+4. Note the resulting entity ID (e.g. `sensor.restore_last_changed`).
+
+Then, in `configuration.yaml`:
+
+```yaml
+restore_last_changed:
+  groups:
+    - sensor.restore_last_changed
+```
+
+Restart Home Assistant once. From then on, edit the group's members in the UI
+to change what gets restored — no further restarts required for membership
+changes (the new list is read on the next HA restart).
+
+### 2. Or list entities inline (legacy / quick setups)
 
 ```yaml
 restore_last_changed:
@@ -31,13 +57,19 @@ restore_last_changed:
     - input_boolean.guest_mode
 ```
 
-Restart Home Assistant after saving the file.
+Both keys can be combined; entities and group members are merged and
+deduplicated.
 
 ### Options
 
 | Key | Required | Description |
 |---|---|---|
-| `entities` | Yes | List of entity IDs whose `last_changed`/`last_updated` should be restored from the recorder database on startup. |
+| `groups` | No | List of group entity IDs (e.g. `sensor.restore_last_changed`). All members of each group are restored. Nested groups are expanded recursively. **Preferred — manage the list from the UI.** |
+| `entities` | No | List of entity IDs to restore directly. Useful for quick setups or one-offs. |
+
+At least one of `groups` or `entities` must be present, otherwise the
+integration loads but does nothing on startup (the `dump` / `restore` services
+are still registered).
 
 ## How it works
 
