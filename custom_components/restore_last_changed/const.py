@@ -3,6 +3,7 @@
 DOMAIN = "restore_last_changed"
 
 CONF_ENTITIES = "entities"
+CONF_GROUPS = "groups"
 
 # Seconds to wait after HA started before querying recorder, so all
 # entity platforms and the recorder's own startup tasks are done.

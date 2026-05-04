@@ -40,7 +40,7 @@ from homeassistant.core import Event, HomeAssistant, ServiceCall, State
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
-from .const import CONF_ENTITIES, DOMAIN, STARTUP_DELAY
+from .const import CONF_ENTITIES, CONF_GROUPS, DOMAIN, STARTUP_DELAY
 from .schema import CONFIG_SCHEMA  # noqa: F401 – HA reads this from the module
 
 _LOGGER = logging.getLogger(__name__)
@@ -77,17 +77,29 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the restore_last_changed integration."""
 
     domain_config = config.get(DOMAIN) or {}
-    entity_ids: list[str] = domain_config.get(CONF_ENTITIES, [])
+    explicit_entities: list[str] = list(domain_config.get(CONF_ENTITIES, []))
+    group_ids: list[str] = list(domain_config.get(CONF_GROUPS, []))
 
     _register_services(hass)
 
-    if not entity_ids:
-        _LOGGER.debug("No entities configured; services are still available.")
+    if not explicit_entities and not group_ids:
+        _LOGGER.debug(
+            "No entities or groups configured; services are still available."
+        )
         return True
 
     async def _restore_on_start(_event: Event) -> None:
         """Run after HA is fully started."""
         await asyncio.sleep(STARTUP_DELAY)
+        entity_ids = _resolve_entity_ids(hass, explicit_entities, group_ids)
+        if not entity_ids:
+            _LOGGER.warning(
+                "restore_last_changed: no entities resolved from config "
+                "(entities=%s groups=%s)",
+                explicit_entities,
+                group_ids,
+            )
+            return
         for entity_id in entity_ids:
             try:
                 await _restore_entity(hass, entity_id, DEFAULT_STRATEGY)
@@ -99,6 +111,56 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.bus.async_listen_once("homeassistant_started", _restore_on_start)
 
     return True
+
+
+def _resolve_entity_ids(
+    hass: HomeAssistant,
+    explicit_entities: list[str],
+    group_ids: list[str],
+) -> list[str]:
+    """Flatten group members into a deduplicated entity list.
+
+    Groups are resolved by reading the ``entity_id`` attribute on the group's
+    state. Nested groups are expanded recursively; cycles are guarded by a
+    visited set. Group entities themselves are dropped from the final list —
+    only their leaf members get their timestamps restored.
+    """
+    resolved: list[str] = []
+    seen: set[str] = set()
+
+    def _add(entity_id: str) -> None:
+        if entity_id in seen:
+            return
+        seen.add(entity_id)
+        resolved.append(entity_id)
+
+    for entity_id in explicit_entities:
+        _add(entity_id)
+
+    visited_groups: set[str] = set()
+
+    def _expand_group(group_id: str) -> None:
+        if group_id in visited_groups:
+            return
+        visited_groups.add(group_id)
+        state = hass.states.get(group_id)
+        if state is None:
+            _LOGGER.warning(
+                "Configured group %s not found in state machine; skipping",
+                group_id,
+            )
+            return
+        members = state.attributes.get("entity_id") or ()
+        for member in members:
+            if member.startswith("group."):
+                _expand_group(member)
+            else:
+                _add(member)
+
+    for group_id in group_ids:
+        _expand_group(group_id)
+
+    return resolved
 
 
 def _register_services(hass: HomeAssistant) -> None:

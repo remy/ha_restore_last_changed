@@ -20,8 +20,14 @@ input_number:
     step: 1
     initial: 0
 
+group:
+  restore_last_changed:
+    name: Restore Last Changed
+    entities:
+      - input_boolean.test_one
+      - input_boolean.test_two
+      - input_number.test_number
+
 restore_last_changed:
-  entities:
-    - input_boolean.test_one
-    - input_boolean.test_two
-    - input_number.test_number
+  groups:
+    - group.restore_last_changed
